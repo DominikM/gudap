@@ -44,9 +44,9 @@
 (defclass dap-connection ()
   ((name
     :initarg :name)
-   (process
-    :initarg :process
-    :accessor process)
+   (dap-process
+    :initarg :dap-process
+    :accessor dap-process)
    (event-dispatcher
     :initform #'ignore
     :initarg :event-dispatcher)
@@ -56,24 +56,27 @@
    (response-dispatcher
     :initform #'ignore
     :initarg :response-dispatcher)
-   (buffer
+   (message-queue
     :initform '()
-    :accessor buffer)
+    :accessor message-queue)
    (expected-seq
     :initform 1
     :accessor expected-seq)
    (expected-bytes
-    :accessor expected-bytes)))
+    :accessor expected-bytes)
+   (comint-process
+    :initarg :comint-process
+    :accessor comint-process)))
 
 (cl-defgeneric connection-live-p (connection))
 
 (cl-defmethod connection-live-p ((connection dap-connection))
-  (process-live-p (process connection)))
+  (process-live-p (dap-process connection)))
 
 (defvar gudap-server-programs '(((elixir-mode elixir-ts-mode) . ("elixir-ls-debug"))))
 
 (defvar gudap--connections-by-project (make-hash-table :test #'equal)
-  "Keys are projects.  Values are lists of dap connecections.")
+  "Keys are projects.  Values are dap connecections.")
 
 (defvar gudap--cached-connection nil)
 
@@ -94,39 +97,73 @@
       (when live-p (ignore-errors (gudap-shutdown current-conn)))
       (gudap--connect managed-major-modes project 'dap-connection contact language-id))))
 
+(defun gudap-shutdown ()
+  (interactive)
+  (let* ((conn (gudap-current-connection)))
+    (kill-buffer (process-buffer (dap-process conn)))
+    (kill-buffer (process-buffer (comint-process conn))))
+    (remhash (eglot--current-project) gudap--connections-by-project)
+    (setq gudap--cached-connection nil))
+
 (defun gudap--connect (managed-modes project class contact language-id)
   (let* ((nickname (project-name project))
 	 (readable-name (format "GUDAP (%s/%s)" nickname managed-modes))
-	 (process (make-process :name     readable-name
-				:buffer   readable-name
-				:command  contact
-				:filter   'dap--process-filter
-				:sentinel 'dap--server-sentinel))
-	 (server (make-instance class
-				:name readable-name
-				:process process
-				:event-dispatcher 'gudap-event-dispatcher)))
-    (process-put process 'dap-connection server)
-    (puthash project
-	     (cons server
-		   (gethash project gudap--connections-by-project '()))
-	     gudap--connections-by-project)))
+	 (dap-proc (make-process :name     readable-name
+				 :buffer   (generate-new-buffer readable-name)
+				 :command  contact
+				 :filter   'dap--process-filter
+				 :sentinel 'dap--server-sentinel
+				 :noquery  t))
+	 (comint-name (format "%s comint" readable-name))
+	 (comint-proc   (make-process :name    comint-name
+				      :buffer  (generate-new-buffer comint-name)
+				      :command nil
+				      :noquery t))
+	 (conn (make-instance class
+			      :name readable-name
+			      :dap-process dap-proc
+			      :event-dispatcher 'gudap-event-dispatcher
+			      :comint-process comint-proc)))
+    (process-put dap-proc 'dap-connection conn)
+    (process-put comint-proc 'dap-connection conn)
+    (puthash project conn gudap--connections-by-project)
+    (gudap--init-comint conn)))
+
+(defun gudap--init-comint (conn)
+  (let ((buffer (process-buffer (comint-process conn))))
+    (with-current-buffer buffer
+      (comint-mode)
+      (setq-local comint-input-sender #'gudap-comint-receive)
+      (setq-local comint-prompt-regexp "^> ")
+      (setq-local comint-use-prompt-regexp t))))
+
+(defun gudap-comint-receive (proc message)
+  (message message))
+
+(defun gudap-comint-send (conn message)
+  (comint-output-filter
+   (comint-process conn)
+   (format "%s\n" message)))
 
 (defun gudap-event-dispatcher (conn message)
-  (pp message))
+  (cl-destructuring-bind (&key event body &allow-other-keys)
+      message
+    (cond
+     (
+      (equal event "output")
+      (gudap-comint-send conn (plist-get body :output))))))
+
 
 (defun gudap-current-connection ()
   "Return logical Gudap server for current buffer, nil if none."
   (setq gudap--cached-connection
         (or gudap--cached-connection
             (gethash (eglot--current-project) gudap--connections-by-project))))
-
+ 
 (defun dap--server-sentinel (proc event)
   (message "gudap sentinel event: %s" event)
-  (let ((server (process-get proc 'dap-connection)))
-    (puthash (eglot--current-project)
-	     (remove server (gethash (eglot--current-project) gudap--connections-by-project))
-	     gudap--connections-by-project))
+  (let ((conn (process-get proc 'dap-connection)))
+    (remhash (eglot--current-project) gudap--connections-by-project))
   (setq gudap--cached-connection nil))
 
 (defvar dap--in-process-filter nil
@@ -215,37 +252,37 @@
           (setf (expected-bytes connection) expected-bytes))))))
 
 (defun dap-connection-receive (conn message)
-  (if (dap-buffer-full (buffer conn))
+  (if (dap-queue-full-p (message-queue conn))
       (dap-connection-process-messages conn t))
-  (setf (buffer conn) (dap-buffer-insert (buffer conn) message))
+  (setf (message-queue conn) (dap-queue-insert (message-queue conn) message))
   (dap-connection-process-messages conn))
 
-(defun dap-buffer-insert (buffer message)
-  (if (dap-buffer-full-p buffer)
-      (error "Buffer full."))
+(defun dap-queue-insert (queue message)
+  (if (dap-queue-full-p queue)
+      (error "Queue full."))
   (let ((seq (plist-get :seq message))
-	(next-seq (plist-get :seq (cadr buffer))))
+	(next-seq (plist-get :seq (cadr queue))))
     (cond
      (
       (not next-seq)
       (list message))
      (
       (> seq next-seq)
-      (cons (car buffer) (dap-message-buffer-insert (cdr buffer) message)))
+      (cons (car queue) (dap-queue-insert (cdr queue) message)))
      (
       t
-      (cons message buffer)))))
+      (cons message queue)))))
 
-(defun dap-buffer-full-p (buffer)
-  (length= buffer dap-buffer-size))
+(defun dap-queue-full-p (queue)
+  (length= queue dap-buffer-size))
 
 (defun dap-connection-process-messages (conn &optional all)
-  (let ((next-message (car (buffer conn))))
+  (let ((next-message (car (message-queue conn))))
     (while (and next-message
 		(or all
 		    (= (plist-get next-message :seq) (expected-seq conn))))
-      (dap-process-message conn (pop (buffer conn)))
-      (setq next-message (car (buffer conn))))))
+      (dap-process-message conn (pop (message-queue conn)))
+      (setq next-message (car (message-queue conn))))))
 
 (defun dap-process-message (conn message)
   (cl-destructuring-bind (&key seq type &allow-other-keys)
@@ -260,7 +297,7 @@
       (funcall (slot-value conn 'request-dispatcher) conn message))
      (;; response
       (equal type "response")
-      (funcall (slot-value conn 'response-dispatcher) conn message)))))	   
+      (funcall (slot-value conn 'response-dispatcher) conn message)))))
 
 ;;;###autoload
 (provide 'gudap)
