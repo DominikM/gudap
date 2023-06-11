@@ -75,7 +75,10 @@
     :accessor launch-args)
    (breakpoints ;; key is file path, value is list of breakpoints
     :initform (make-hash-table :test #'equal)
-    :accessor breakpoints)))
+    :accessor breakpoints)
+   (breakpoints-req-seq ;; key is seq number, value is file path
+    :initform (make-hash-table :test #'equal)
+    :accessor breakpoints-req-seq)))
 
 (cl-defgeneric connection-live-p (connection))
 
@@ -94,6 +97,8 @@
 
 (defvar gudap--connections-by-project (make-hash-table :test #'equal)
   "Keys are projects.  Values are dap connecections.")
+
+(defvar gudap--cached-connection nil)
 
 (defun gudap-reset ()
   (interactive)
@@ -187,7 +192,44 @@
       (dap--send-all-breakpoints conn)
       (dap--send-config-done conn)))))
 
+(defun gudap-response-dispatcher (conn message)
+  (cl-destructuring-bind (&key command request_seq body &allow-other-keys)
+      message
+    (cond
+     (
+      (equal command "setBreakpoints")
+      (gudap--verify-breakpoints conn message)))))
+
+(defun gudap--verify-breakpoints (conn message)
+  (cl-destructuring-bind (&key request_seq body &allow-other-keys)
+      message
+    (let* ((bp-results-vector (plist-get body :breakpoints))
+	   (bp-results (append bp-results-vector nil)) ;; convert to list
+	   (bp-path (gethash request_seq (breakpoints-req-seq conn)))
+	   (pending-bps (gethash bp-path (breakpoints conn)))
+	   (valid-bps (gudap--validate-breakpoints pending-bps bp-results)))
+      (puthash bp-path valid-bps (breakpoints conn))
+      (remhash request_seq (breakpoints-req-seq conn))
+      (message "breakpoints validated"))))
+
+(defun gudap--validate-breakpoints (bps bp-results)
+  (if (/= (length bps) (length bp-results))
+      (error "Breakpoints and breakpoints results must be the same length."))
+  (let ((bp (car bps))
+	(bp-result (car bp-results)))
+    (cond
+     (
+      (null bp)
+      '())
+     (
+      (plist-get bp-result :verified)
+      (cons bp (gudap--validate-breakpoints (cdr bps) (cdr bp-results))))
+     (
+      (not (plist-get bp-result :verified))
+      (gudap--validate-breakpoints (cdr bps) (cdr bp-results))))))
+
 (defun dap--send-breakpoints (conn path breakpoints)
+  (puthash (next-seq conn) path (breakpoints-req-seq conn))
   (dap-connection-send
    conn
    (list :seq (next-seq conn)
@@ -203,8 +245,6 @@
      (dap--send-breakpoints conn path bps))
    (breakpoints conn)))
 
-(defun gudap-response-dispatcher (conn message))
-
 (defun gudap-current-connection ()
   "Return logical Gudap server for current buffer, nil if none."
   (setq gudap--cached-connection
@@ -218,9 +258,6 @@
 					   launch-keys))
 	 (launch-args (funcall (alist-get launch-key (launch-args conn) nil nil #'equal) (project-current))))
     (dap--send-launch conn launch-args)))
-
-
-
 
 (defun dap--send-initialize (conn)
   (let ((message (list :seq (next-seq conn)
@@ -244,15 +281,14 @@
     (dap-connection-send conn message)))
 
 (defun dap--server-sentinel (proc event)
-  (pp event)
   (let ((conn (process-get proc 'dap-connection)))
     (remhash (eglot--current-project) gudap--connections-by-project))
   (setq gudap--cached-connection nil))
 
 (defun dap-connection-send (conn message)
-  (message "\nSending message:\n")
-  (pp message)
-  (message "\n")
+  ;; (message "\nSending message:\n")
+  ;; (pp message)
+  ;; (message "\n")
   (let* ((json-object-type 'plist)
 	 (json (jsonrpc--json-encode message))
 	 (headers `(("Content-Length" . ,(format "%d" (string-bytes json)))))
