@@ -72,7 +72,10 @@
     :accessor next-seq)
    (launch-args
     :initarg :launch-args
-    :accessor launch-args)))
+    :accessor launch-args)
+   (breakpoints ;; key is file path, value is list of breakpoints
+    :initform (make-hash-table :test #'equal)
+    :accessor breakpoints)))
 
 (cl-defgeneric connection-live-p (connection))
 
@@ -88,7 +91,6 @@
 						       :request "launch"
 						       :task "phx.server"
 						       :projectDir (file-truename (project-root project)))))))))
-
 
 (defvar gudap--connections-by-project (make-hash-table :test #'equal)
   "Keys are projects.  Values are dap connecections.")
@@ -138,7 +140,7 @@
 				 :noquery  t
 				 :connection-type 'pipe
 				 :coding 'utf-8-emacs-unix))
-	 (comint-name (format "%s comint" readable-name))
+	 (comint-name (format "%s SHELL" readable-name))
 	 (comint-proc   (make-process :name    comint-name
 				      :buffer  (generate-new-buffer comint-name)
 				      :command nil
@@ -182,10 +184,26 @@
       (gudap-comint-send conn (plist-get body :output)))
      (
       (equal event "initialized")
+      (dap--send-all-breakpoints conn)
       (dap--send-config-done conn)))))
 
-(defun gudap-response-dispatcher (conn message))
+(defun dap--send-breakpoints (conn path breakpoints)
+  (dap-connection-send
+   conn
+   (list :seq (next-seq conn)
+	 :type "request"
+	 :command "setBreakpoints"
+	 :arguments
+	 (list :source `(:path ,path)
+	       :breakpoints (vconcat breakpoints)))))
 
+(defun dap--send-all-breakpoints (conn)
+  (maphash
+   (lambda (path bps)
+     (dap--send-breakpoints conn path bps))
+   (breakpoints conn)))
+
+(defun gudap-response-dispatcher (conn message))
 
 (defun gudap-current-connection ()
   "Return logical Gudap server for current buffer, nil if none."
@@ -379,6 +397,20 @@
      (;; response
       (equal type "response")
       (funcall (slot-value conn 'response-dispatcher) conn message)))))
+
+(defun gudap-break (conn)
+  (interactive (list (gudap-current-connection)))
+  (push (gudap--source-breakpoint) (gethash (buffer-file-name) (breakpoints conn))))
+
+(defun gudap--source-breakpoint ()
+  (list :line   (save-restriction
+		  (widen)
+		  (+ (count-lines (point-min) (point))
+		     (if (bolp) 1 0)))
+	:column (1+ (current-column))))
+
+(defun gudap--source (file-path)
+  (list :path file-path))
 
 ;;;###autoload
 (provide 'gudap)
