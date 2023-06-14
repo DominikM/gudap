@@ -85,7 +85,15 @@
 (cl-defmethod connection-live-p ((connection dap-connection))
   (process-live-p (dap-process connection)))
 
-(defvar gudap-server-programs '(((elixir-mode elixir-ts-mode) . ("elixir-ls-debug"))))
+(defvar gudap-server-programs
+  '(((elixir-mode elixir-ts-mode) . ("elixir-ls-debug"))
+    ((java-mode java-ts-mode) . (lambda (_inter)
+				  (let ((port (eglot-execute-command
+					       (eglot-current-server)
+					       "vscode.java.startDebugSession"
+					       '())))
+				    `("localhost" ,port))))))
+
 
 (defvar gudap-launch-args
   `(((elixir-mode elixir-ts-mode) . (("phx" . ,(lambda (project)
@@ -137,19 +145,26 @@
 (defun gudap--connect (managed-modes project class contact language-id)
   (let* ((nickname (project-name project))
 	 (readable-name (format "GUDAP (%s/%s)" nickname managed-modes))
-	 (dap-proc (make-process :name     readable-name
-				 :buffer   (generate-new-buffer readable-name)
-				 :command  contact
-				 :filter   'dap--process-filter
-				 :sentinel 'dap--server-sentinel
-				 :noquery  t
-				 :connection-type 'pipe
-				 :coding 'utf-8-emacs-unix))
+	 (dap-proc (if (integerp (cadr contact))
+		       (open-network-stream
+			readable-name
+			(generate-new-buffer readable-name)
+			(car contact)
+			(cadr contact)
+			:sentinel 'dap--server-sentinel
+			:noquery t)
+		     (make-process :name     readable-name
+				   :buffer   (generate-new-buffer readable-name)
+				   :command  contact
+				   :sentinel 'dap--server-sentinel
+				   :noquery  t
+				   :connection-type 'pipe
+				   :coding 'utf-8-emacs-unix)))
 	 (comint-name (format "%s SHELL" readable-name))
-	 (comint-proc   (make-process :name    comint-name
-				      :buffer  (generate-new-buffer comint-name)
-				      :command nil
-				      :noquery t))
+	 (comint-proc (make-process :name    comint-name
+				    :buffer  (generate-new-buffer comint-name)
+				    :command nil
+				    :noquery t))
 	 (conn (make-instance class
 			      :name readable-name
 			      :dap-process dap-proc
@@ -157,6 +172,7 @@
 			      :response-dispatcher 'gudap-response-dispatcher
 			      :comint-process comint-proc
 			      :launch-args (alist-get managed-modes gudap-launch-args nil nil #'equal))))
+    (set-process-filter dap-proc 'dap--process-filter)
     (setq gudap--cached-connection conn)
     (process-put dap-proc 'dap-connection conn)
     (process-put comint-proc 'dap-connection conn)
