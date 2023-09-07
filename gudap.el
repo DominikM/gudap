@@ -48,30 +48,67 @@
     :accessor gudap--process)
    (-expected-bytes
     :accessor gudap--expected-bytes)
-   (-sent-requests
-    :initform (make-hash-table)
-    :accessor gudap--sent-requests) ;; seq to request command
    (gud-buffer
     :initarg :gud-buffer
     :accessor gudap-gud-buffer)
    (next-seq
-    :initform 0
-    :accessor gudap--next-seq)))
+    :initform 1
+    :accessor gudap--next-seq)
+   (initialized
+    :initform nil
+    :accessor gudap-initialized)
+   (breakpoints ;; file path to list of plists (:line lineNum)
+    :initform (make-hash-table :test 'equal)
+    :accessor gudap-breakpoints)
+   (capabilities
+    :accessor gudap-capabilities)
+   (request-args ;; map of req_seq to list of request arguments
+    :initform (make-hash-table)
+    :accessor gudap-request-args)))
 
-(defvar gudap-server-programs
+(defvar gudap-server-programs-and-launch
   '(((elixir-mode elixir-ts-mode) . ("elixir-ls-debug"))
     (c++-mode . "lldb-vscode")))
 
+(defvar gudap-active-server nil)
+
+(defun gudap--buffer-line ()
+  (save-restriction
+    (widen)
+    (+ (count-lines (point-min) (point))
+       (if (bolp) 1 0))))
+
+(defun gudap--gud-break ()
+  (interactive)
+  (let* ((server gudap-active-server)
+	 (file-path (buffer-file-name))
+	 (old-breakpoints (gethash file-path (gudap-breakpoints server)))
+	 (new-breakpoints (cons (list :line (gudap--buffer-line)) old-breakpoints)))
+    (gudap-send-request
+     server
+     'setBreakpoints
+     (list :source (gudap--dap-type-source file-path)
+	   :breakpoints (vconcat new-breakpoints)
+	   :lines (vconcat (mapcar (lambda (bp) (plist-get bp :line)) new-breakpoints))))))
+
+(defun gudap--dap-type-sourcebreak (line)
+  (list :line line))
+
+(defun gudap--dap-type-source (&optional path)
+  (let ((path (or path
+		  (buffer-file-name))))
+    (list :path path)))
+
 (defun gudap (server-command)
-  (gudap--connect server-command))
+  (gudap--connect server-command)
+  (defalias 'gud-break 'gudap--gud-break))
 
 (defun gudap--connect (server-command)
   (let* ((nickname server-command)
 	 (readable-name (format "GUDAP (%s)" nickname))
 	 (gud-buffer (gud-common-init "cat"
 				      (lambda (_file args) args)
-				      #'identity
-				      (lambda (m) (gudap--message "%s" m))))
+				      #'identity))
 	 (dap-proc  (make-process :name            readable-name
 				  :buffer          (generate-new-buffer readable-name)
 				  :command         (list server-command)
@@ -83,30 +120,61 @@
 			      :name readable-name
 			      :process dap-proc
 			      :gud-buffer gud-buffer)))
-    (process-put dap-proc 'gudap-connection conn)))
+    (process-put dap-proc 'gudap-connection conn)
+    (setq gudap-active-server conn)
+    (gudap-send-request conn 'initialize (gudap--initialize-arguments))))
 
 (cl-defgeneric gudap-send-request (server command arguments))
 
-(cl-defmethod gudap-send-request (server (command (eql initialize)) arguments)
-  (puthash (gudap--next-seq server) 'initialize (gudap--sent-requests server))
+(cl-defmethod gudap-send-request (server command arguments &optional extra)
+  (puthash (gudap--next-seq server)
+	   (append arguments extra)
+	   (gudap-request-args server))
   (gudap--connection-send
    server
    (list :type "request"
-	 :command "initialize"
-	 :arguments (gudap--initialize-arguments))))
+	 :command (symbol-name command)
+	 :arguments arguments)))
 
-(cl-defgeneric gudap-handle-response (server type body))
 
-(cl-defmethod gudap-handle-response (server type body)
-  (gudap--message "%s" body))
+(cl-defgeneric gudap-handle-response (server command req-args success body))
 
-(cl-defmethod gudap-handle-response (server (type (eql initialize)) body)
+(cl-defmethod gudap-handle-response (server (type (eql initialize)) req-args success body)
   (gudap--message "initialized"))
+
+(cl-defmethod gudap-handle-response (server (type (eql setBreakpoints)) req-args (success (eql t)) body)
+  (let ((req-path (gudap--path (plist-get req-args :source)))
+	(req-breakpoints (plist-get req-args :breakpoints))
+	(res-breakpoints (plist-get body :breakpoints)))
+    (if (not (eql (length req-breakpoints) (length res-breakpoints)))
+	(gudap--message "mismatched breakpoints, ignoring")
+      (let ((valid-breakpoints (cl-loop for req-bp across req-breakpoints
+					for res-bp across res-breakpoints
+					for req-line = (plist-get req-bp :line)
+					for res-line = (plist-get res-bp :line)
+					if (plist-get res-bp :verified)
+					collect (list :line (or res-line req-line)))))
+	(puthash req-path valid-breakpoints (gudap-breakpoints server))))))
+
+(cl-defmethod gudap-handle-response (server (type (eql stackTrace)) req-args (success (eql t)) body)
+  (if (plist-get req-args :show)
+      (cl-destructuring-bind (&key stackFrames &allow-other-keys) body
+	(if (length> stackFrames 0)
+	    (let* ((cur-frame (aref stackFrames 0))
+		   (path (gudap--path (plist-get cur-frame :source)))
+		   (line (plist-get cur-frame :line)))
+	      (if (> line 0)
+		  (progn
+		    (setq gud-last-frame (cons path line))
+		    (gud-display-frame))))))))
+	     
+(cl-defmethod gudap-handle-response (server command req-args success body)
+  (gudap--message "unknown response: %s" body))
 
 (cl-defgeneric gudap-handle-event (server event body))
 
 (cl-defmethod gudap-handle-event (server event body)
-  (gudap--message "%s" message))
+  (gudap--message "%s" body))
 
 (cl-defmethod gudap-handle-event (server (event (eql output)) body)
   (let ((gud-process (get-buffer-process (gudap-gud-buffer server))))
@@ -116,7 +184,23 @@
       (pcase category
 	("console" (gud-filter gud-process output))))))
 
+(cl-defmethod gudap-handle-event (server (event (eql initialized)) body)
+  (setf (gudap-initialized server) t))
+
+(cl-defmethod gudap-handle-event (server (event (eql stopped)) body)
+  (cl-destructuring-bind (&key reason threadId &allow-other-keys) body
+    (pcase reason
+      ("breakpoint"
+       (gudap-gud-output server (format "breakpoint hit"))
+       (gudap-send-request server 'stackTrace `(:threadId ,threadId) '(:show t))))))
+
 (cl-defgeneric gudap-handle-request (server command arguments))
+
+(cl-defgeneric gudap-gud-output (server output))
+
+(cl-defmethod gudap-gud-output (server output)
+  (let ((gud-process (get-buffer-process (gudap-gud-buffer server))))
+    (gud-filter gud-process (format "%s\n" output))))
 
 (defun gudap--initialize-arguments ()
   (list :clientId "gudap"
@@ -135,6 +219,9 @@
 	:supportsMemoryEvent nil
 	:supportsArgsCanBeInterpretedByShell nil
 	:supportsStartDebuggingRequest nil))
+
+(defun gudap--path (source)
+  (plist-get source :path))
 
 ;; Utils    
 
@@ -230,24 +317,24 @@
           (setf (gudap--expected-bytes connection) expected-bytes))))))
 
 (defun gudap--connection-receive (conn message)
-  (cl-destructuring-bind (&key seq type event body arguments &allow-other-keys) message
+  (gudap--message "received message: %s" message)
+  (cl-destructuring-bind (&key seq request_seq type command event body arguments success &allow-other-keys) message
     (cond
      (;; event
       (string-equal type "event")
       (gudap-handle-event conn (intern event) body))
      (;; response
       (string-equal type "response")
-      (let ((request-type (gethash seq (gudap--sent-requests conn))))
-	(if request-type
-	    (gudap-handle-response conn request-type body)
-	  (gudap--message "received response to a nonexistent request. ignoring")))
-      (remhash seq (gudap--sent-requests conn)))
+      (let ((request-args (gethash request_seq (gudap-request-args conn))))	
+	(gudap-handle-response conn (intern command) request-args success body)
+	(remhash request_seq (gudap-request-args conn))))
      (;; reverse request
       (string-equal type "request")
       (gudap-handle-request conn (intern command) arguments)))))
 
 (defun gudap--connection-send (conn message)
   (setq message (plist-put message :seq (gudap--next-seq conn)))
+  (gudap--message "sent message: %s" message)
   (let* ((json-object-type 'plist)
 	 (json (jsonrpc--json-encode message))
 	 (headers `(("Content-Length" . ,(format "%d" (string-bytes json)))))
