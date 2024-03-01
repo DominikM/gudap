@@ -271,7 +271,7 @@
                         (and (search-forward-regexp
                               "\\(?:.*: .*\r\n\\)*Content-Length: \
 *\\([[:digit:]]+\\)\r\n\\(?:.*: .*\r\n\\)*\r\n"
-                              (+ (point) 200)
+			      nil
                               t)
                              (string-to-number (match-string 1))))
                   (unless expected-bytes
