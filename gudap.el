@@ -63,7 +63,7 @@
    (initialized
     :initform nil
     :accessor gudap-initialized)
-   (breakpoints ;; file path to list of plists (:line lineNum)
+   (breakpoints
     :initform (make-hash-table :test 'equal)
     :accessor gudap-breakpoints)
    (capabilities
@@ -81,6 +81,43 @@
     :initform t
     :accessor gudap-stopped)))
 
+(defclass breakpoint ()
+  ((id
+    :initarg :id
+    :accessor gudap-bp-id)
+   (verified
+    :initarg :verified
+    :accessor gudap-bp-verified)
+   (source
+    :initarg :source
+    :accessor gudap-bp-source)
+   (line
+    :initarg :line
+    :accessor gudap-bp-line)))
+
+(defclass source-breakpoint (breakpoint)
+  ((condition
+    :initarg :condition
+    :initform nil
+    :accessor gudap-source-bp-condition)))
+
+(cl-defmethod gudap-bp-update ((bp source-breakpoint) server-bp)
+  (cl-destructuring-bind (&key id verified source line &allow-other-keys) server-bp
+    (make-instance 'source-breakpoint
+		   :id id
+		   :verified verified
+		   :source source
+		   :line line
+		   :condition (gudap-source-bp-condition bp))))
+
+(cl-defmethod gudap-bp-params ((bp source-breakpoint))
+  (with-slots (line condition) bp
+    (list :line line
+	  :condition condition)))
+
+(defun gudap-bps-params (bps)
+  (mapcar 'gudap-bp-params bps))
+
 (defvar gudap-server-programs-and-launch
   '(((c++-mode c-mode rust-mode) "lldb-vscode" (lambda ()
 						  (list :name "gudap-lldb"
@@ -94,19 +131,6 @@
     (widen)
     (+ (count-lines (point-min) (point))
        (if (bolp) 1 0))))
-
-(defun gudap--source-breakpoint (&optional breakpoint)
-  (if breakpoint
-      (cl-destructuring-bind (&key line column &allow-other-keys) breakpoint
-	(list :line line))
-    (list :line (line-number-at-pos))))
-
-(defun gudap--breakpoints-source-breakpoints (breakpoints)
-  "Convert BREAKPOINTS to source breakpoints for setBreakpoints request."
-  (mapcar 'gudap--source-breakpoint breakpoints))
-
-(defun gudap--source (filepath)
-  (list :path filepath))
 
 (defmacro gudap-with-initialized (server-var &rest body)
   (declare (indent defun))
@@ -131,39 +155,55 @@
      'continue
      (list :threadId (gudap-current-thread server)))))
 
+(defun gudap-update-breakpoints (server file-path bps server-bps)
+  (puthash file-path
+	   (cl-loop for bp across bps
+		    for server-bp across server-bps
+		    collect (gudap-bp-update bp server-bp))
+	   (gudap-breakpoints server)))
 
-(defun gudap--gud-break ()
+(defun gudap--gud-break (&optional condition)
   (interactive)
   (gudap-with-initialized gudap-active-server
     (let* ((file-path (buffer-file-name))
-	   (old-breakpoints (gethash file-path (gudap-breakpoints server)))
-	   (source-breakpoints (vconcat (cons (gudap--source-breakpoint)
-					      (gudap--breakpoints-source-breakpoints old-breakpoints)))))
+	   (current-bps (gethash file-path (gudap-breakpoints server)))
+	   (new-bp (make-instance 'source-breakpoint
+				  :line (line-number-at-pos)
+				  :condition condition))
+	   (bps (vconcat (cons new-bp current-bps))))
       (gudap-send-request
        server
        'setBreakpoints
        (list :source (gudap--dap-type-source file-path)
-	     :breakpoints source-breakpoints)))))
+	     :breakpoints (vconcat (mapcar 'gudap-bp-params bps)))
+       (lambda (server success body)
+	 (gudap-update-breakpoints server file-path bps (plist-get body :breakpoints)))))))
+
+(defun gudap--gud-break-cond ()
+  (interactive)
+  (gudap--gud-break (read-string "Expression: ")))
 
 (defun gudap--gud-remove ()
   (interactive)
   (gudap-with-initialized gudap-active-server
     (let* ((file-path (buffer-file-name))
 	   (line (line-number-at-pos))
-	   (old-breakpoints (gethash file-path (gudap-breakpoints server))))
-      (if old-breakpoints
+	   (current-breakpoints (gethash file-path (gudap-breakpoints server))))
+      (if current-breakpoints
 	  (let* ((filtered-breakpoints (seq-filter
-					(lambda (bp) (/= line (plist-get bp :line)))
-					old-breakpoints))
-		 (source-breakpoints (vconcat (gudap--breakpoints-source-breakpoints filtered-breakpoints))))
-	    (if (= (length old-breakpoints) (length source-breakpoints))
+					(lambda (bp) (/= line (gudap-bp-line bp)))
+					current-breakpoints))
+		 (source-breakpoints (vconcat (gudap-bps-params filtered-breakpoints))))
+	    (if (= (length current-breakpoints) (length source-breakpoints))
 		(gudap--message "No breakpoints at location!")
 	      (remhash file-path (gudap-breakpoints server))
 	      (gudap-send-request
 	       server
 	       'setBreakpoints
 	       (list :source (gudap--dap-type-source file-path)
-		     :breakpoints source-breakpoints))))
+		     :breakpoints source-breakpoints)
+	       (lambda (server success body)
+		 (gudap-update-breakpoints server file-path source-breakpoints (plist-get body :breakpoints))))))
 	(gudap--message "No breakpoints at location!")))))
 
 (defun gudap--gud-next ()
@@ -197,6 +237,7 @@
     (gudap--connect (car program-and-launch-config) (cdr program-and-launch-config) gud-comint-buffer)
 
     (defalias 'gud-break 'gudap--gud-break)
+    (defalias 'gud-break-cond 'gudap--gud-break-cond)
     (defalias 'gud-cont 'gudap--gud-cont)
     (defalias 'gud-run 'gudap--gud-run)
     (defalias 'gud-remove 'gudap--gud-remove)
@@ -309,20 +350,6 @@
 	       (and (symbolp (car p-l)) (equal mode-name (car p-l))))
 	   return p-l))
 
-(cl-defgeneric gudap-update-breakpoints (server breakpoints))
-
-(cl-defmethod gudap-update-breakpoints (server breakpoints)
-  "Breakpoints are assumed to belong to the same source"
-  (if (length> breakpoints 0)
-      (cl-loop for breakpoint across breakpoints
-	       with path = (plist-get (plist-get (aref breakpoints 0) :source) :path)
-	       with updated-breakpoints = '() do
-	       (cl-destructuring-bind (&key verified &allow-other-keys) breakpoint
-		 (if verified
-		     (push breakpoint updated-breakpoints)))
-	       finally
-	       (puthash path updated-breakpoints (gudap-breakpoints server)))))
-
 ;;; REQUESTS
 
 (cl-defgeneric gudap-send-request (server command arguments))
@@ -343,9 +370,6 @@
 
 (cl-defmethod gudap-handle-response (server (_type (eql initialize)) _success _body _err-msg)
   (gudap-send-request server 'launch (gudap-launch-config server)))
-
-(cl-defmethod gudap-handle-response (server (type (eql setBreakpoints)) (success (eql t)) body _err-msg)
-  (gudap-update-breakpoints server (plist-get body :breakpoints)))
 
 (cl-defmethod gudap-handle-response (server (type (eql evaluate)) (success (eql t)) body _err-msg)
   (gudap-gud-output server (plist-get body :result)))
