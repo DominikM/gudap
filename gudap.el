@@ -76,7 +76,10 @@
     :accessor gudap-current-thread)
    (current-frame
     :initform nil
-    :accessor gudap-current-frame)))
+    :accessor gudap-current-frame)
+   (stopped
+    :initform t
+    :accessor gudap-stopped)))
 
 (defvar gudap-server-programs-and-launch
   '(((c++-mode c-mode rust-mode) "lldb-vscode" (lambda ()
@@ -162,6 +165,24 @@
 	       (list :source (gudap--dap-type-source file-path)
 		     :breakpoints source-breakpoints))))
 	(gudap--message "No breakpoints at location!")))))
+
+(defun gudap--gud-next ()
+  (interactive)
+  (gudap-with-initialized gudap-active-server
+    (if (gudap-stopped server)
+	(gudap-send-request
+	 server
+	 'next
+	 (list :threadId (gudap-current-thread server))))))
+
+(defun gudap--gud-stepi ()
+  (interactive)
+  (gudap-with-initialized gudap-active-server
+    (if (gudap-stopped server)
+	(gudap-send-request
+	 server
+	 'stepIn
+	 (list :threadId (gudap-current-thread server))))))
 	
 (defun gudap--dap-type-source (file-path)
   (list :path file-path))
@@ -179,6 +200,8 @@
     (defalias 'gud-cont 'gudap--gud-cont)
     (defalias 'gud-run 'gudap--gud-run)
     (defalias 'gud-remove 'gudap--gud-remove)
+    (defalias 'gud-next 'gudap--gud-next)
+    (defalias 'gud-stepi 'gudap--gud-stepi)
 
     (setq gdb-first-prompt t)
     (setq gud-running nil)
@@ -313,8 +336,6 @@
 	 :command (symbol-name command)
 	 :arguments arguments)))
 
-
-
 ;;; RESPONSES
 
 (cl-defgeneric gudap-handle-response (server command success body err-msg)
@@ -331,6 +352,9 @@
 
 (cl-defmethod gudap-handle-response (server (type (eql evaluate)) _success _body err-msg)
   (gudap-gud-output server err-msg))
+
+(cl-defmethod gudap-handle-response (server (type (eql continue)) (success (eql t)) _body err-msg)
+  (setf (gudap-stopped server) nil))
 
 (cl-defmethod gudap-handle-response (server command success body err-msg)
   (gudap--message "unknown response: %s" body))
@@ -353,7 +377,8 @@
   (setf (gudap-initialized server) t))
 
 (cl-defmethod gudap-handle-event (server (event (eql terminated)) body)
-  (setf (gudap-initialized server) nil))
+  (setf (gudap-initialized server) nil
+	(gudap-stopped server) t))
 
 (defun gudap-gud-goto-frame-from-stack-trace (server success stack-trace-body)
   (when success
@@ -369,8 +394,9 @@
   (cl-destructuring-bind (&key reason threadId &allow-other-keys) body
     (cond
      ( ;; breakpoint
-      (equal reason "breakpoint")
-      (setf (gudap-current-thread server) threadId)
+      (or (equal reason "breakpoint") (equal reason "step"))
+      (setf (gudap-current-thread server) threadId
+	    (gudap-stopped server) t)
       (gudap-send-request server
 			  'stackTrace
 			  (list :threadId threadId
