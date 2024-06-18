@@ -139,16 +139,14 @@
      (if initialized
 	 (progn ,@body))))
 
-(defun gudap--gud-run ()
-  (interactive)
+(defun gudap--gud-run (arg)
   (gudap-with-initialized gudap-active-server
     (gudap-send-request
      gudap-active-server
      'configurationDone
      '())))
 
-(defun gudap--gud-cont ()
-  (interactive)
+(defun gudap--gud-cont (arg)
   (gudap-with-initialized gudap-active-server
     (gudap-send-request
      server
@@ -162,14 +160,13 @@
 		    collect (gudap-bp-update bp server-bp))
 	   (gudap-breakpoints server)))
 
-(defun gudap--gud-break (&optional condition)
-  (interactive)
+(defun gudap--gud-break (arg)
   (gudap-with-initialized gudap-active-server
     (let* ((file-path (buffer-file-name))
 	   (current-bps (gethash file-path (gudap-breakpoints server)))
 	   (new-bp (make-instance 'source-breakpoint
 				  :line (line-number-at-pos)
-				  :condition condition))
+				  :condition (if (> arg 1) (read-string "Expression: "))))
 	   (bps (vconcat (cons new-bp current-bps))))
       (gudap-send-request
        server
@@ -179,12 +176,10 @@
        (lambda (server success body)
 	 (gudap-update-breakpoints server file-path bps (plist-get body :breakpoints)))))))
 
-(defun gudap--gud-break-cond ()
-  (interactive)
+(defun gudap--gud-break-cond (arg)
   (gudap--gud-break (read-string "Expression: ")))
 
-(defun gudap--gud-remove ()
-  (interactive)
+(defun gudap--gud-remove (arg)
   (gudap-with-initialized gudap-active-server
     (let* ((file-path (buffer-file-name))
 	   (line (line-number-at-pos))
@@ -206,8 +201,7 @@
 		 (gudap-update-breakpoints server file-path source-breakpoints (plist-get body :breakpoints))))))
 	(gudap--message "No breakpoints at location!")))))
 
-(defun gudap--gud-next ()
-  (interactive)
+(defun gudap--gud-next (arg)
   (gudap-with-initialized gudap-active-server
     (if (gudap-stopped server)
 	(gudap-send-request
@@ -215,8 +209,7 @@
 	 'next
 	 (list :threadId (gudap-current-thread server))))))
 
-(defun gudap--gud-stepi ()
-  (interactive)
+(defun gudap--gud-stepi (arg)
   (gudap-with-initialized gudap-active-server
     (if (gudap-stopped server)
 	(gudap-send-request
@@ -227,6 +220,14 @@
 (defun gudap--dap-type-source (file-path)
   (list :path file-path))
 
+(defmacro def-gudap-cmd (gud-cmd gudap-fn key)
+  `(progn
+     (defalias ',gud-cmd (lambda (arg)
+			   (interactive "p")
+			   (,gudap-fn arg)))
+     ,(if key `(local-set-key ,(concat "\C-c" key) #',gud-cmd))
+     ,(if key `(define-key gud-global-map ,key #',gud-cmd))))
+
 (defun gudap ()
   (interactive)
   (let ((program-and-launch-config (gudap--guess-contact))
@@ -236,13 +237,12 @@
     (setq comint-prompt-regexp "^>")
     (gudap--connect (car program-and-launch-config) (cdr program-and-launch-config) gud-comint-buffer)
 
-    (defalias 'gud-break 'gudap--gud-break)
-    (defalias 'gud-break-cond 'gudap--gud-break-cond)
-    (defalias 'gud-cont 'gudap--gud-cont)
-    (defalias 'gud-run 'gudap--gud-run)
-    (defalias 'gud-remove 'gudap--gud-remove)
-    (defalias 'gud-next 'gudap--gud-next)
-    (defalias 'gud-stepi 'gudap--gud-stepi)
+    (def-gudap-cmd gud-break      gudap--gud-break      "\C-b")
+    (def-gudap-cmd gud-cont       gudap--gud-cont       "\C-r")
+    (def-gudap-cmd gud-run        gudap--gud-run        nil)
+    (def-gudap-cmd gud-remove     gudap--gud-remove     "\C-d")
+    (def-gudap-cmd gud-next       gudap--gud-next       "\C-n")
+    (def-gudap-cmd gud-stepi      gudap--gud-stepi      "\C-i")
 
     (setq gdb-first-prompt t)
     (setq gud-running nil)
